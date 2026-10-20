@@ -163,7 +163,7 @@ async function fetchSubmission(submissionId) {
 // Retries pending lookups and returns once the submission reaches a terminal status.
 async function fetchCompletedSubmission(submissionId) {
   for (let attempt = 1; attempt <= MAX_LOOKUP_ATTEMPTS; attempt += 1) {
-    const submission = await fetchSubmission(submissionId);
+        const submission = await fetchSubmission(submissionId);
     if (submission && typeof submission.statusCode === "number") {
       if (
         submission.statusCode === 10 ||
@@ -172,7 +172,6 @@ async function fetchCompletedSubmission(submissionId) {
         return submission;
       }
     }
-
     if (attempt < MAX_LOOKUP_ATTEMPTS) {
       await wait(LOOKUP_RETRY_DELAY_MS);
     }
@@ -207,7 +206,8 @@ async function pushAcceptedSubmission(submissionId) {
   try {
     const submission = await fetchCompletedSubmission(submissionId);
     if (submission.statusCode !== 10) {
-      showNotice("Submission was not accepted; nothing was pushed.", true);
+      console.log("CodePusher: statusCode =", submission.statusCode);
+      showNotice(`Not accepted (statusCode ${submission.statusCode}); nothing was pushed.`, true);
       return;
     }
 
