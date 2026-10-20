@@ -3,8 +3,13 @@
 const LANGUAGE_EXTENSIONS = {
   c: "c",
   "c++": "cpp",
+  bash: "sh",
   csharp: "cs",
+  dart: "dart",
+  elixir: "ex",
+  erlang: "erl",
   go: "go",
+  golang: "go",
   java: "java",
   javascript: "js",
   kotlin: "kt",
@@ -12,6 +17,7 @@ const LANGUAGE_EXTENSIONS = {
   php: "php",
   python: "py",
   python3: "py",
+  racket: "rkt",
   ruby: "rb",
   rust: "rs",
   scala: "scala",
@@ -55,22 +61,38 @@ function isValidSolution(message) {
 async function saveSettings(settings) {
   const savedSettings = await chrome.storage.local.get("githubToken");
   const token = typeof settings?.token === "string" ? settings.token.trim() : "";
+  const username =
+    typeof settings?.username === "string" ? settings.username.trim() : "";
+  const repo = typeof settings?.repo === "string" ? settings.repo.trim() : "";
 
   if (
     !settings ||
     (!token && !savedSettings.githubToken) ||
-    typeof settings.username !== "string" ||
-    !settings.username.trim() ||
-    typeof settings.repo !== "string" ||
-    !settings.repo.trim()
+    !username ||
+    !repo
   ) {
     throw new Error("Enter a GitHub token, username, and repository name.");
   }
 
+  if (!/^[A-Za-z0-9._-]+$/.test(username)) {
+    throw new Error(
+      "Enter a valid GitHub username using only letters, numbers, dots, dashes, and underscores."
+    );
+  }
+
+  if (repo.includes("/") || repo.includes("://")) {
+    throw new Error("Enter only the repo name, not the URL");
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(repo)) {
+    throw new Error(
+      "Enter a valid repo name using only letters, numbers, dots, dashes, and underscores."
+    );
+  }
+
   await chrome.storage.local.set({
     githubToken: token || savedSettings.githubToken,
-    githubUsername: settings.username.trim(),
-    githubRepo: settings.repo.trim()
+    githubUsername: username,
+    githubRepo: repo
   });
 }
 
@@ -101,10 +123,30 @@ function encodeBase64(text) {
   return btoa(binary);
 }
 
+// Maps common GitHub authorization, lookup, and conflict failures to actionable text.
+function getGitHubError(status) {
+  if (status === 401) {
+    return new Error("GitHub rejected the token. It may be expired or incorrect.");
+  }
+  if (status === 403) {
+    return new Error("The token lacks Contents write access to this repository.");
+  }
+  if (status === 404) {
+    return new Error(
+      "Repository or username not found, or the token is not scoped to this repository."
+    );
+  }
+  if (status === 409 || status === 422) {
+    return new Error("GitHub reported a conflict. Please try again.");
+  }
+  return new Error(`GitHub request failed with status ${status}.`);
+}
+
 // Calls GitHub's Contents API and reports HTTP failures without exposing secrets.
-async function githubRequest(url, token, options) {
+async function githubRequest(url, token, options = {}) {
+  const { allowNotFound = false, ...requestOptions } = options;
   const response = await fetch(url, {
-    ...options,
+    ...requestOptions,
     headers: {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${token}`,
@@ -113,11 +155,21 @@ async function githubRequest(url, token, options) {
     }
   });
 
+  if (response.status === 404 && allowNotFound) {
+    return null;
+  }
   if (!response.ok) {
-    throw new Error(`GitHub request failed with status ${response.status}.`);
+    throw getGitHubError(response.status);
   }
 
   return response.json();
+}
+
+// Decodes GitHub's base64 file content for exact comparison with the submitted code.
+function decodeGitHubContent(content) {
+  const binary = atob(content.replace(/\s/g, ""));
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
 }
 
 // Creates or updates the solution file using GitHub's Contents API.
@@ -142,30 +194,29 @@ async function pushSolution(solution) {
     encodedPath
   ].join("/");
   const apiUrl = `https://api.github.com/repos/${repositoryPath}`;
-  let sha;
-
-  const existingResponse = await fetch(apiUrl, {
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${settings.githubToken}`,
-      "X-GitHub-Api-Version": "2022-11-28"
-    }
+  const existingFile = await githubRequest(apiUrl, settings.githubToken, {
+    allowNotFound: true
   });
 
-  if (existingResponse.ok) {
-    const existingFile = await existingResponse.json();
-    sha = existingFile.sha;
-  } else if (existingResponse.status !== 404) {
-    throw new Error(`GitHub lookup failed with status ${existingResponse.status}.`);
+  if (
+    existingFile?.encoding === "base64" &&
+    typeof existingFile.content === "string" &&
+    decodeGitHubContent(existingFile.content) === solution.code
+  ) {
+    return {
+      path,
+      url: existingFile.html_url,
+      message: "Already up to date"
+    };
   }
 
   const payload = {
-    message: `Add ${solution.site} solution: ${solution.problem}`,
+    message: `${existingFile ? "Update" : "Add"} ${solution.site} solution: ${solution.problem}`,
     content: encodeBase64(solution.code)
   };
 
-  if (sha) {
-    payload.sha = sha;
+  if (existingFile?.sha) {
+    payload.sha = existingFile.sha;
   }
 
   const result = await githubRequest(apiUrl, settings.githubToken, {
@@ -174,7 +225,11 @@ async function pushSolution(solution) {
     body: JSON.stringify(payload)
   });
 
-  return { path, url: result.content.html_url };
+  return {
+    path,
+    url: result.content.html_url,
+    message: existingFile ? "Updated on GitHub" : "Pushed to GitHub"
+  };
 }
 
 // Routes options and LeetCode messages while keeping token data in the worker.

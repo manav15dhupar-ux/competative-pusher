@@ -5,6 +5,23 @@ const statusMessage = document.querySelector("#status");
 const usernameInput = document.querySelector("#username");
 const repoInput = document.querySelector("#repo");
 
+// Validates GitHub identifiers before sending settings to the background worker.
+function getSettingsValidationError(settings) {
+  const username = settings.username.trim();
+  const repo = settings.repo.trim();
+
+  if (!/^[A-Za-z0-9._-]+$/.test(username)) {
+    return "Enter a valid GitHub username using only letters, numbers, dots, dashes, and underscores.";
+  }
+  if (repo.includes("/") || repo.includes("://")) {
+    return "Enter only the repo name, not the URL";
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(repo)) {
+    return "Enter a valid repo name using only letters, numbers, dots, dashes, and underscores.";
+  }
+  return "";
+}
+
 // Loads the non-secret repository settings from the background worker.
 async function loadSettings() {
   statusMessage.textContent = "Loading saved settings...";
@@ -35,6 +52,11 @@ async function saveSettings(event) {
     username: usernameInput.value,
     repo: repoInput.value
   };
+  const validationError = getSettingsValidationError(settings);
+  if (validationError) {
+    statusMessage.textContent = validationError;
+    return;
+  }
 
   try {
     const response = await chrome.runtime.sendMessage({
