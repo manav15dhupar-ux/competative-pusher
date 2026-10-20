@@ -13,8 +13,9 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://leetcode.com/*"],
-      "js": ["content-leetcode.js"]
+      "matches": ["https://leetcode.com/problems/*"],
+      "js": ["content-leetcode.js"],
+      "run_at": "document_idle"
     }
   ],
   "options_page": "options.html"
