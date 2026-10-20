@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "CodePusher",
+  "version": "0.1.0",
+  "description": "Save accepted LeetCode solutions to a GitHub repository.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://leetcode.com/*",
+    "https://api.github.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://leetcode.com/*"],
+      "js": ["content-leetcode.js"]
+    }
+  ],
+  "options_page": "options.html"
+}
