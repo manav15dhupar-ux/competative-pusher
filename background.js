@@ -5,11 +5,14 @@ const LANGUAGE_EXTENSIONS = {
   "c++": "cpp",
   bash: "sh",
   csharp: "cs",
+  cpp: "cpp",
   dart: "dart",
+  d: "d",
   elixir: "ex",
   erlang: "erl",
   go: "go",
   golang: "go",
+  haskell: "hs",
   java: "java",
   javascript: "js",
   kotlin: "kt",
@@ -30,14 +33,18 @@ function isOptionsPage(sender) {
   return sender.url === chrome.runtime.getURL("options.html");
 }
 
-// Confirms a solution message came from a LeetCode page.
-function isLeetCodePage(sender) {
+// Confirms a solution message came from the page for its declared site.
+function isSupportedSitePage(sender, site) {
   if (!sender.url) {
     return false;
   }
 
   try {
-    return new URL(sender.url).origin === "https://leetcode.com";
+    const expectedOrigin = {
+      leetcode: "https://leetcode.com",
+      codeforces: "https://codeforces.com"
+    }[site];
+    return Boolean(expectedOrigin) && new URL(sender.url).origin === expectedOrigin;
   } catch {
     return false;
   }
@@ -47,7 +54,7 @@ function isLeetCodePage(sender) {
 function isValidSolution(message) {
   return (
     message &&
-    message.site === "leetcode" &&
+    ["leetcode", "codeforces"].includes(message.site) &&
     typeof message.problem === "string" &&
     /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(message.problem) &&
     typeof message.language === "string" &&
@@ -269,8 +276,11 @@ function handleMessage(message, sender, sendResponse) {
     return false;
   }
 
-  if (!isLeetCodePage(sender)) {
-    sendResponse({ ok: false, error: "Solutions can only be submitted from LeetCode." });
+  if (!isSupportedSitePage(sender, message.site)) {
+    sendResponse({
+      ok: false,
+      error: "Solutions can only be submitted from their supported coding site."
+    });
     return false;
   }
 

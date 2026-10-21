@@ -2,10 +2,11 @@
   "manifest_version": 3,
   "name": "CodePusher",
   "version": "0.1.0",
-  "description": "Save accepted LeetCode solutions to a GitHub repository.",
+  "description": "Save accepted LeetCode and Codeforces solutions to a GitHub repository.",
   "permissions": ["storage"],
   "host_permissions": [
     "https://leetcode.com/*",
+    "https://codeforces.com/*",
     "https://api.github.com/*"
   ],
   "background": {
@@ -18,6 +19,15 @@
         "https://leetcode.com/submissions/detail/*"
       ],
       "js": ["content-leetcode.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://codeforces.com/contest/*/submission/*",
+        "https://codeforces.com/problemset/submission/*/*",
+        "https://codeforces.com/gym/*/submission/*"
+      ],
+      "js": ["content-codeforces.js"],
       "run_at": "document_idle"
     }
   ],
