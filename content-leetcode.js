@@ -34,12 +34,13 @@ const LANGUAGE_INFO = {
   typescript: { language: "typescript", extension: "ts" }
 };
 const TERMINAL_NON_ACCEPTED_STATUSES = new Set([
-  11, 12, 13, 14, 15, 16, 20, 21, 22, 30
+  11, 12, 13, 14, 15, 20, 21, 22, 30
 ]);
 const SUBMISSION_QUERY = `
   query submissionDetails($submissionId: Int!) {
     submissionDetails(submissionId: $submissionId) {
       statusCode
+      statusDisplay
       code
       lang {
         name
@@ -47,6 +48,34 @@ const SUBMISSION_QUERY = `
       }
       question {
         titleSlug
+      }
+    }
+  }
+`;
+const QUESTION_QUERY = `
+  query questionDetails($titleSlug: String!) {
+    question(titleSlug: $titleSlug) {
+      questionFrontendId
+      title
+      difficulty
+      content
+      topicTags {
+        name
+      }
+    }
+  }
+`;
+const SUBMISSION_LIST_QUERY = `
+  query submissionList($offset: Int!, $limit: Int!, $lastKey: String) {
+    submissionList(offset: $offset, limit: $limit, lastKey: $lastKey) {
+      lastKey
+      hasNext
+      submissions {
+        id
+        statusDisplay
+        titleSlug
+        timestamp
+        lang
       }
     }
   }
@@ -160,17 +189,171 @@ async function fetchSubmission(submissionId) {
   return result.data?.submissionDetails || null;
 }
 
+// Loads LeetCode problem metadata using the active session's CSRF-protected GraphQL request.
+async function fetchQuestionMetadata(titleSlug) {
+  const response = await fetch("/graphql/", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "Content-Type": "application/json",
+      "x-csrftoken": getCsrfToken()
+    },
+    body: JSON.stringify({
+      query: QUESTION_QUERY,
+      variables: { titleSlug }
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`LeetCode problem lookup failed (${response.status}).`);
+  }
+
+  const result = await response.json();
+  if (result.errors?.length) {
+    throw new Error(
+      result.errors[0].message || "LeetCode could not return the problem details."
+    );
+  }
+  return result.data?.question || null;
+}
+
+// Requests one page of LeetCode's GraphQL submission history.
+async function fetchSubmissionListGraphQL(offset, lastKey) {
+  const response = await fetch("/graphql/", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "Content-Type": "application/json",
+      "x-csrftoken": getCsrfToken()
+    },
+    body: JSON.stringify({
+      query: SUBMISSION_LIST_QUERY,
+      variables: { offset, limit: 20, lastKey }
+    })
+  });
+  if (!response.ok) {
+    const error = new Error(`LeetCode submission list failed (${response.status}).`);
+    error.status = response.status;
+    throw error;
+  }
+
+  const result = await response.json();
+  if (result.errors?.length) {
+    throw new Error(result.errors[0].message || "LeetCode could not list submissions.");
+  }
+  const page = result.data?.submissionList;
+  if (!page || !Array.isArray(page.submissions)) {
+    throw new Error("LeetCode returned an invalid submission list.");
+  }
+  return page;
+}
+
+// Lists accepted LeetCode submissions with GraphQL and falls back to the submissions API.
+async function listLeetCodeSubmissions() {
+  try {
+    const submissions = [];
+    let offset = 0;
+    let lastKey = null;
+    while (true) {
+      const page = await fetchSubmissionListGraphQL(offset, lastKey);
+      submissions.push(...page.submissions);
+      if (!page.hasNext) {
+        break;
+      }
+      const nextLastKey = page.lastKey || null;
+      if (nextLastKey === lastKey && page.submissions.length === 0) {
+        throw new Error("LeetCode submission pagination did not advance.");
+      }
+      lastKey = nextLastKey;
+      offset += 20;
+    }
+    console.log("CodePusher: LeetCode sync listing used GraphQL.");
+    return submissions
+      .filter((submission) => submission.statusDisplay === "Accepted")
+      .map((submission) => ({
+        id: String(submission.id),
+        slug: submission.titleSlug,
+        timestamp: Number(submission.timestamp) || 0
+      }))
+      .filter((item) => item.id && item.slug);
+  } catch (graphqlError) {
+    try {
+      const submissions = [];
+      let offset = 0;
+      let lastKey = "";
+      while (true) {
+        const url = `/api/submissions/?offset=${offset}&limit=20&lastkey=${encodeURIComponent(lastKey)}`;
+        const response = await fetch(url, { credentials: "same-origin" });
+        if (!response.ok) {
+          const error = new Error(`LeetCode submissions API failed (${response.status}).`);
+          error.status = response.status;
+          throw error;
+        }
+        const page = await response.json();
+        if (!Array.isArray(page.submissions)) {
+          throw new Error("LeetCode submissions API returned an invalid response.");
+        }
+        submissions.push(...page.submissions);
+        if (!page.has_next) {
+          break;
+        }
+        const nextLastKey = page.last_key || page.lastKey || "";
+        if (nextLastKey === lastKey && page.submissions.length === 0) {
+          throw new Error("LeetCode API pagination did not advance.");
+        }
+        lastKey = nextLastKey;
+        offset += 20;
+      }
+      console.log("CodePusher: LeetCode sync listing used the submissions API.");
+      return submissions
+        .filter((submission) =>
+          submission.status_display === "Accepted" ||
+          submission.statusDisplay === "Accepted"
+        )
+        .map((submission) => ({
+          id: String(submission.id),
+          slug: submission.title_slug || submission.titleSlug,
+          timestamp: Number(submission.timestamp) || 0
+        }))
+        .filter((item) => item.id && item.slug);
+    } catch (apiError) {
+      console.log(
+        "CodePusher: LeetCode sync listing failed.",
+        graphqlError?.message || graphqlError,
+        apiError?.message || apiError
+      );
+      const error = new Error(
+        `Could not list LeetCode submissions using GraphQL or the submissions API. GraphQL: ${graphqlError?.message || "failed"}; API: ${apiError?.message || "failed"}`
+      );
+      error.status = graphqlError?.status === 429 || apiError?.status === 429 ? 429 : undefined;
+      throw error;
+    }
+  }
+}
+
 // Retries pending lookups and returns once the submission reaches a terminal status.
 async function fetchCompletedSubmission(submissionId) {
   for (let attempt = 1; attempt <= MAX_LOOKUP_ATTEMPTS; attempt += 1) {
-        const submission = await fetchSubmission(submissionId);
-    if (submission && typeof submission.statusCode === "number") {
-      if (
+    const submission = await fetchSubmission(submissionId);
+    console.log(
+      "CodePusher: status",
+      submission?.statusCode,
+      submission?.statusDisplay,
+      "id",
+      submissionId
+    );
+    if (
+      submission &&
+      (
+        submission.statusDisplay === "Accepted" ||
         submission.statusCode === 10 ||
-        TERMINAL_NON_ACCEPTED_STATUSES.has(submission.statusCode)
-      ) {
-        return submission;
-      }
+        (
+          typeof submission.statusCode === "number" &&
+          TERMINAL_NON_ACCEPTED_STATUSES.has(submission.statusCode)
+        )
+      )
+    ) {
+      return submission;
     }
     if (attempt < MAX_LOOKUP_ATTEMPTS) {
       await wait(LOOKUP_RETRY_DELAY_MS);
@@ -194,21 +377,28 @@ function isExtensionContextInvalidated(error) {
 }
 
 // Fetches, validates, and pushes one submission without marking failures as processed.
-async function pushAcceptedSubmission(submissionId) {
+async function pushAcceptedSubmission(submissionId, { throwErrors = false } = {}) {
   if (
     processedSubmissionIds.has(submissionId) ||
     inFlightSubmissionIds.has(submissionId)
   ) {
-    return;
+    return { status: "unchanged" };
   }
 
   inFlightSubmissionIds.add(submissionId);
   try {
     const submission = await fetchCompletedSubmission(submissionId);
-    if (submission.statusCode !== 10) {
-      console.log("CodePusher: statusCode =", submission.statusCode);
-      showNotice(`Not accepted (statusCode ${submission.statusCode}); nothing was pushed.`, true);
-      return;
+    if (
+      submission.statusDisplay !== "Accepted" &&
+      submission.statusCode !== 10
+    ) {
+      if (!throwErrors) {
+        showNotice(
+          `Not accepted: ${submission.statusDisplay || "Unknown"} (code ${submission.statusCode}); nothing was pushed.`,
+          true
+        );
+      }
+      return { status: "failed" };
     }
 
     const problem = submission.question?.titleSlug;
@@ -226,9 +416,50 @@ async function pushAcceptedSubmission(submissionId) {
       throw new Error(`Unsupported LeetCode language: ${languageName || "unknown"}.`);
     }
 
+    const question = await fetchQuestionMetadata(problem);
+    const number = question?.questionFrontendId;
+    const title = question?.title;
+    const difficulty = question?.difficulty;
+    if (
+      (typeof number !== "string" && typeof number !== "number") ||
+      !/^\d+$/.test(String(number)) ||
+      typeof title !== "string" ||
+      !title.trim() ||
+      !["Easy", "Medium", "Hard"].includes(difficulty)
+    ) {
+      throw new Error("LeetCode did not return complete problem metadata.");
+    }
+
+    const statement = question.content
+      ? CodePusherMarkdown.convertHtmlToMarkdown(question.content, "https://leetcode.com")
+      : "Problem statement not available.";
+    const url = `https://leetcode.com/problems/${problem}/`;
+    const readme = [
+      `# ${number}. ${title.trim()}`,
+      "",
+      "| Field | Value |",
+      "| --- | --- |",
+      "| Platform | LeetCode |",
+      `| Problem number | ${number} |`,
+      `| Difficulty | ${difficulty} |`,
+      `| Language | ${languageInfo.language} |`,
+      `| Link | [${url}](${url}) |`,
+      "",
+      "## Problem",
+      "",
+      statement,
+      ""
+    ].join("\n");
+
     const response = await chrome.runtime.sendMessage({
       site: "leetcode",
       problem,
+      number: String(number),
+      title: title.trim(),
+      difficulty,
+      rating: "",
+      url,
+      readme,
       language: languageInfo.language,
       code: submission.code
     });
@@ -237,16 +468,61 @@ async function pushAcceptedSubmission(submissionId) {
     }
 
     processedSubmissionIds.add(submissionId);
-    showNotice(response.message || "Pushed to GitHub");
+    if (!throwErrors) {
+      showNotice(response.message || "Pushed to GitHub");
+    }
+    return {
+      status: response.unchanged?.length === 2 ? "unchanged" : "pushed"
+    };
   } catch (error) {
+    if (throwErrors) {
+      throw error;
+    }
     if (isExtensionContextInvalidated(error)) {
       showNotice("Extension reloaded. Refresh this page.", true);
     } else {
       showNotice(error.message || "Could not push the solution to GitHub.", true);
     }
+    return { status: "failed" };
   } finally {
     inFlightSubmissionIds.delete(submissionId);
   }
+}
+
+// Pushes one historical LeetCode submission through the live solution pipeline.
+async function pushOneLeetCodeSubmission(item) {
+  const result = await pushAcceptedSubmission(item.id, { throwErrors: true });
+  if (result?.status === "failed") {
+    throw new Error("LeetCode submission is no longer accepted.");
+  }
+  return result;
+}
+
+// Provides LeetCode history listing and delegates each item to the existing push pipeline.
+const LEETCODE_SYNC_PROVIDER = {
+  name: "LeetCode",
+  listAcceptedSubmissions: listLeetCodeSubmissions,
+  pushOne: pushOneLeetCodeSubmission,
+  delayMs: 2000
+};
+
+// Accepts sync requests only from this extension's popup.
+function handleLeetCodeSyncMessage(message, sender, sendResponse) {
+  if (message?.type !== "syncAll") {
+    return false;
+  }
+  if (sender.id !== chrome.runtime.id) {
+    sendResponse({ ok: false, error: "Sync requests must come from CodePusher." });
+    return false;
+  }
+  if (!window.CodePusherSync?.run) {
+    sendResponse({ ok: false, error: "The sync runner is unavailable." });
+    return false;
+  }
+
+  void window.CodePusherSync.run(LEETCODE_SYNC_PROVIDER, message.limit);
+  sendResponse({ ok: true });
+  return false;
 }
 
 // Checks the current URL and starts a push only when it enters a new submission route.
@@ -289,8 +565,11 @@ function startRouteDetection() {
   window.addEventListener("hashchange", scheduleRouteCheck);
   wrapHistoryMethod("pushState");
   wrapHistoryMethod("replaceState");
-  window.setInterval(checkSubmissionRoute, 1000);
   checkSubmissionRoute();
+  if (getSubmissionRoute()) {
+    window.setInterval(checkSubmissionRoute, 1000);
+  }
 }
 
 startRouteDetection();
+chrome.runtime.onMessage.addListener(handleLeetCodeSyncMessage);

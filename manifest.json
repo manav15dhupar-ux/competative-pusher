@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "description": "Save accepted LeetCode and Codeforces solutions to a GitHub repository.",
   "permissions": ["storage"],
+  "action": {
+    "default_popup": "popup.html"
+  },
   "host_permissions": [
     "https://leetcode.com/*",
     "https://codeforces.com/*",
@@ -15,19 +18,16 @@
   "content_scripts": [
     {
       "matches": [
-        "https://leetcode.com/problems/*",
-        "https://leetcode.com/submissions/detail/*"
+        "https://leetcode.com/*"
       ],
-      "js": ["content-leetcode.js"],
+      "js": ["content-markdown.js", "sync-runner.js", "content-leetcode.js"],
       "run_at": "document_idle"
     },
     {
       "matches": [
-        "https://codeforces.com/contest/*/submission/*",
-        "https://codeforces.com/problemset/submission/*/*",
-        "https://codeforces.com/gym/*/submission/*"
+        "https://codeforces.com/*"
       ],
-      "js": ["content-codeforces.js"],
+      "js": ["content-markdown.js", "sync-runner.js", "content-codeforces.js"],
       "run_at": "document_idle"
     }
   ],
