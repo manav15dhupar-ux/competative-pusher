@@ -32,6 +32,20 @@ const MAX_INDEX_BYTES = 1024 * 1024;
 const INDEX_START_MARKER = "<!-- codepusher:start -->";
 const INDEX_END_MARKER = "<!-- codepusher:end -->";
 
+// Restricts extension storage to trusted extension contexts, excluding content scripts.
+async function restrictStorageAccess() {
+  try {
+    await chrome.storage.local.setAccessLevel({
+      accessLevel: "TRUSTED_CONTEXTS"
+    });
+  } catch (error) {
+    console.warn("CodePusher: could not restrict storage access.", error);
+  }
+}
+
+void restrictStorageAccess();
+chrome.runtime.onInstalled.addListener(restrictStorageAccess);
+
 // Confirms a message came from the extension's options page.
 function isOptionsPage(sender) {
   return sender.url === chrome.runtime.getURL("options.html");
