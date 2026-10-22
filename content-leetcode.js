@@ -8,6 +8,7 @@ const MAX_LOOKUP_ATTEMPTS = 10;
 const LOOKUP_RETRY_DELAY_MS = 1500;
 const processedSubmissionIds = new Set();
 const inFlightSubmissionIds = new Set();
+const submissionEntries = new Map();
 const LANGUAGE_INFO = {
   bash: { language: "bash", extension: "sh" },
   c: { language: "c", extension: "c" },
@@ -377,12 +378,23 @@ function isExtensionContextInvalidated(error) {
 }
 
 // Fetches, validates, and pushes one submission without marking failures as processed.
-async function pushAcceptedSubmission(submissionId, { throwErrors = false } = {}) {
-  if (
-    processedSubmissionIds.has(submissionId) ||
-    inFlightSubmissionIds.has(submissionId)
-  ) {
-    return { status: "unchanged" };
+async function pushAcceptedSubmission(
+  submissionId,
+  { throwErrors = false, updateIndex = !throwErrors } = {}
+) {
+  if (processedSubmissionIds.has(submissionId)) {
+    return { status: "unchanged", entry: submissionEntries.get(submissionId) };
+  }
+  if (inFlightSubmissionIds.has(submissionId)) {
+    if (!throwErrors) {
+      return { status: "unchanged", entry: submissionEntries.get(submissionId) };
+    }
+    while (inFlightSubmissionIds.has(submissionId)) {
+      await wait(100);
+    }
+    if (processedSubmissionIds.has(submissionId)) {
+      return { status: "unchanged", entry: submissionEntries.get(submissionId) };
+    }
   }
 
   inFlightSubmissionIds.add(submissionId);
@@ -468,11 +480,21 @@ async function pushAcceptedSubmission(submissionId, { throwErrors = false } = {}
     }
 
     processedSubmissionIds.add(submissionId);
+    const entry = response.entry;
+    if (entry) {
+      submissionEntries.set(submissionId, entry);
+    }
+    const indexError = updateIndex && entry
+      ? await window.CodePusherSync.updateIndex([entry])
+      : "";
     if (!throwErrors) {
-      showNotice(response.message || "Pushed to GitHub");
+      showNotice(indexError
+        ? `Pushed to GitHub, but the solutions index failed: ${indexError}`
+        : response.message || "Pushed to GitHub");
     }
     return {
-      status: response.unchanged?.length === 2 ? "unchanged" : "pushed"
+      status: response.unchanged?.length === 2 ? "unchanged" : "pushed",
+      entry
     };
   } catch (error) {
     if (throwErrors) {
@@ -491,7 +513,10 @@ async function pushAcceptedSubmission(submissionId, { throwErrors = false } = {}
 
 // Pushes one historical LeetCode submission through the live solution pipeline.
 async function pushOneLeetCodeSubmission(item) {
-  const result = await pushAcceptedSubmission(item.id, { throwErrors: true });
+  const result = await pushAcceptedSubmission(item.id, {
+    throwErrors: true,
+    updateIndex: false
+  });
   if (result?.status === "failed") {
     throw new Error("LeetCode submission is no longer accepted.");
   }

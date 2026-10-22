@@ -36,6 +36,19 @@ function waitForSyncDelay(milliseconds) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
+// Sends a batch of problem metadata to the background index updater and returns any error.
+async function updateSolutionsIndex(entries) {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "updateIndex",
+      entries
+    });
+    return response?.ok ? "" : response?.error || "The solutions index update failed.";
+  } catch (error) {
+    return error?.message || "The solutions index update failed.";
+  }
+}
+
 // Deduplicates accepted submissions by problem and selects the newest submission.
 function getNewestSubmissions(items) {
   const newestBySlug = new Map();
@@ -73,6 +86,7 @@ async function runSync(provider, limit) {
 
   syncInProgress = true;
   const counts = { pushed: 0, unchanged: 0, failed: 0 };
+  const entries = [];
   let stopMessage = "";
   try {
     const listedItems = await provider.listAcceptedSubmissions();
@@ -93,6 +107,9 @@ async function runSync(provider, limit) {
       showSyncNotice(`Syncing ${index + 1}/${selected.length}: ${item.slug}`);
       try {
         const result = await provider.pushOne(item);
+        if (result?.entry) {
+          entries.push(result.entry);
+        }
         if (result?.status === "unchanged" || result?.alreadyUpToDate) {
           counts.unchanged += 1;
         } else {
@@ -137,9 +154,16 @@ async function runSync(provider, limit) {
     showSyncNotice(notice, true);
     return { ok: false, error: message };
   } finally {
+    const indexError = await updateSolutionsIndex(entries);
+    if (indexError) {
+      showSyncNotice(`Solutions index update failed: ${indexError}`, true);
+    }
     syncInProgress = false;
   }
 }
 
 // Exposes the shared sync runner to site-specific content-script providers.
-window.CodePusherSync = Object.freeze({ run: runSync });
+window.CodePusherSync = Object.freeze({
+  run: runSync,
+  updateIndex: updateSolutionsIndex
+});

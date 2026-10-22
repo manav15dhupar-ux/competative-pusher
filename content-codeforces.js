@@ -406,7 +406,8 @@ async function pushCodeforcesSolution({
   problemIndex,
   language,
   apiProblem = null,
-  submissionUrl = ""
+  submissionUrl = "",
+  updateIndex = true
 }) {
   const [code, metadata] = await Promise.all([
     fetchSubmissionCode(submissionUrl || window.location.href),
@@ -449,10 +450,18 @@ async function pushCodeforcesSolution({
   if (!response?.ok) {
     throw new Error(response?.error || "The background worker could not push the solution.");
   }
+  const entry = response.entry;
+  const indexError = updateIndex && entry
+    ? await window.CodePusherSync.updateIndex([entry])
+    : "";
   if (id) {
     processedSubmissionIds.add(String(id));
   }
-  return { status: response.unchanged?.length === 2 ? "unchanged" : "pushed" };
+  return {
+    status: response.unchanged?.length === 2 ? "unchanged" : "pushed",
+    entry,
+    indexError
+  };
 }
 
 // Waits for a queued or running submission verdict to become final, up to one minute.
@@ -542,7 +551,9 @@ async function pushAcceptedSubmission(submissionId, contestId) {
     });
 
     processedSubmissionIds.add(submissionId);
-    showNotice(result.status === "unchanged" ? "Already up to date" : "Pushed to GitHub");
+    showNotice(result.indexError
+      ? `Pushed to GitHub, but the solutions index failed: ${result.indexError}`
+      : result.status === "unchanged" ? "Already up to date" : "Pushed to GitHub");
   } catch (error) {
     if (isExtensionContextInvalidated(error)) {
       showNotice("Extension reloaded. Refresh this page.", true);
@@ -637,7 +648,8 @@ async function pushOneCodeforcesSubmission(item) {
     problemIndex: item.problemIndex,
     language: item.language,
     apiProblem: item.problem,
-    submissionUrl
+    submissionUrl,
+    updateIndex: false
   });
 }
 
