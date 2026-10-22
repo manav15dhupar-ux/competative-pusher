@@ -37,6 +37,24 @@ let codeforcesRequestQueue = Promise.resolve();
 let noticeElement;
 let noticeTimer;
 
+// Logs only an HTTP status and a bounded HTML preview when a challenge is detected.
+function logCodeforcesChallenge(status, html) {
+  console.log("CodePusher: Codeforces challenge response", status, html.slice(0, 200));
+}
+
+// Identifies HTTP challenge statuses or recognized interstitial HTML without a source block.
+function isCodeforcesChallenge(status, html) {
+  if ([403, 429, 503].includes(status)) {
+    return true;
+  }
+  if (!html) {
+    return false;
+  }
+  const parsed = new DOMParser().parseFromString(html, "text/html");
+  return !parsed.querySelector("pre#program-source-text") &&
+    /Just a moment|cf-challenge|Enable JavaScript and cookies to continue/i.test(html);
+}
+
 // Extracts the contest and submission IDs from supported Codeforces submission routes.
 function getSubmissionRoute() {
   for (const routePattern of SUBMISSION_ROUTE_PATTERNS) {
@@ -52,30 +70,37 @@ function getSubmissionRoute() {
   return null;
 }
 
-// Serializes Codeforces requests and enforces a two-second gap between their starts.
+// Serializes Codeforces requests and enforces a four-second gap between their starts.
 function fetchCodeforces(url, options = {}) {
   const request = codeforcesRequestQueue.then(async () => {
     const elapsed = Date.now() - lastCodeforcesRequestAt;
-    if (lastCodeforcesRequestAt && elapsed < 2000) {
-      await new Promise((resolve) => window.setTimeout(resolve, 2000 - elapsed));
+    if (lastCodeforcesRequestAt && elapsed < 4000) {
+      await new Promise((resolve) => window.setTimeout(resolve, 4000 - elapsed));
     }
     const startedAt = Date.now();
     lastCodeforcesRequestAt = startedAt;
     const response = await fetch(url, options);
+    const contentType = response.headers?.get("content-type") || "";
+    const challengeStatus = [403, 429, 503].includes(response.status);
+    const responseBody = contentType.includes("text/html") || challengeStatus
+      ? await response.clone().text()
+      : "";
+    const html = contentType.includes("text/html") || /^\s*</.test(responseBody)
+      ? responseBody
+      : "";
+    if (isCodeforcesChallenge(response.status, html)) {
+      logCodeforcesChallenge(response.status, html);
+      const error = new Error(`Codeforces challenge response (${response.status}).`);
+      error.status = response.status;
+      error.stopSync = true;
+      error.isChallenge = true;
+      throw error;
+    }
     if (!response.ok) {
       const error = new Error(`Codeforces request failed (${response.status}).`);
       error.status = response.status;
       error.stopSync = true;
       throw error;
-    }
-    if (response.headers?.get("content-type")?.includes("text/html")) {
-      const pageText = await response.clone().text();
-      if (/captcha|verify (?:that )?you are human|challenge-platform|cf-chl-/i.test(pageText)) {
-        const error = new Error("Codeforces returned a captcha or challenge page.");
-        error.status = 403;
-        error.stopSync = true;
-        throw error;
-      }
     }
     return response;
   });
@@ -409,10 +434,8 @@ async function pushCodeforcesSolution({
   submissionUrl = "",
   updateIndex = true
 }) {
-  const [code, metadata] = await Promise.all([
-    fetchSubmissionCode(submissionUrl || window.location.href),
-    fetchProblemMetadata(route, problemIndex, apiProblem)
-  ]);
+  const code = await fetchSubmissionCode(submissionUrl || window.location.href);
+  const metadata = await fetchProblemMetadata(route, problemIndex, apiProblem);
   const url = getCodeforcesProblemUrl(route, problemIndex);
   const safeTags = metadata.tags.map((tag) => String(tag).replace(/\|/g, "\\|"));
   const readme = [
@@ -619,13 +642,60 @@ async function listCodeforcesSubmissions() {
         contestId: String(submission.contestId),
         problemIndex,
         language: getLanguage(submission.programmingLanguage || ""),
+        programmingLanguage: String(submission.programmingLanguage || ""),
         problem: {
           name: submission.problem.name,
-          rating: submission.problem.rating,
+          rating: Number.isSafeInteger(submission.problem.rating) && submission.problem.rating >= 0
+            ? submission.problem.rating
+            : "Unrated",
           tags: submission.problem.tags
         }
       };
     });
+}
+
+// Keeps the newest accepted Codeforces API item for each contest problem.
+function getNewestCodeforcesSubmissions(items) {
+  const newestBySlug = new Map();
+  for (const item of items) {
+    const previous = newestBySlug.get(item.slug);
+    if (!previous || item.timestamp > previous.timestamp) {
+      newestBySlug.set(item.slug, item);
+    }
+  }
+  return [...newestBySlug.values()];
+}
+
+// Finds the existing Codeforces folder using its contest-and-index prefix.
+function getExistingCodeforcesFolder(item, folders) {
+  const prefix = `${item.slug}-`;
+  return folders.codeforces.find((folder) => folder.startsWith(prefix)) || "";
+}
+
+// Builds validated index metadata directly from a Codeforces API item and known folder.
+function buildCodeforcesIndexEntry(item, folder) {
+  const title = item.problem?.name;
+  const language = item.programmingLanguage;
+  if (
+    typeof title !== "string" ||
+    !title.trim() ||
+    title.length > 300 ||
+    !language ||
+    language.length > 32
+  ) {
+    return null;
+  }
+  const number = `${item.contestId}${item.problemIndex.toUpperCase()}`;
+  return {
+    platform: "codeforces",
+    number,
+    title,
+    difficulty: "",
+    rating: item.problem.rating,
+    folder,
+    url: `https://codeforces.com/contest/${item.contestId}/problem/${item.problemIndex}`,
+    language
+  };
 }
 
 // Pushes one API-listed Codeforces submission using provider metadata where available.
@@ -642,7 +712,7 @@ async function pushOneCodeforcesSubmission(item) {
     `/contest/${item.contestId}/submission/${item.id}`,
     "https://codeforces.com"
   ).href;
-  return pushCodeforcesSolution({
+  const result = await pushCodeforcesSolution({
     id: item.id,
     route,
     problemIndex: item.problemIndex,
@@ -651,17 +721,62 @@ async function pushOneCodeforcesSubmission(item) {
     submissionUrl,
     updateIndex: false
   });
+  if (result.entry && item.programmingLanguage) {
+    result.entry.language = item.programmingLanguage;
+  }
+  return result;
 }
 
 const CODEFORCES_SYNC_PROVIDER = {
   name: "Codeforces",
   listAcceptedSubmissions: listCodeforcesSubmissions,
+  getExistingFolder: getExistingCodeforcesFolder,
+  getIndexEntry: buildCodeforcesIndexEntry,
   pushOne: pushOneCodeforcesSubmission,
-  delayMs: 2500
+  delayMs: 4000
 };
+
+// Rebuilds index rows from Codeforces API metadata and existing folders without fetching pages.
+async function rebuildCodeforcesIndexOnly() {
+  showNotice("Rebuilding Codeforces index...");
+  try {
+    const submissions = getNewestCodeforcesSubmissions(
+      await listCodeforcesSubmissions()
+    );
+    const folders = await window.CodePusherSync.listExistingFolders();
+    const entries = submissions
+      .map((item) => {
+        const folder = getExistingCodeforcesFolder(item, folders);
+        return folder ? buildCodeforcesIndexEntry(item, folder) : null;
+      })
+      .filter(Boolean);
+    const indexError = await window.CodePusherSync.updateIndex(entries);
+    if (indexError) {
+      showNotice(`Codeforces index rebuild failed: ${indexError}`, true);
+      return;
+    }
+    showNotice(`Codeforces index rebuilt: ${entries.length} entries.`);
+  } catch (error) {
+    showNotice(error.message || "Could not rebuild the Codeforces index.", true);
+  }
+}
 
 // Accepts sync requests only from this extension's popup.
 function handleCodeforcesSyncMessage(message, sender, sendResponse) {
+  if (message?.type === "rebuildIndexOnly") {
+    if (sender.id !== chrome.runtime.id) {
+      sendResponse({ ok: false, error: "Rebuild requests must come from CodePusher." });
+      return false;
+    }
+    if (!window.CodePusherSync?.listExistingFolders || !window.CodePusherSync?.updateIndex) {
+      sendResponse({ ok: false, error: "The sync runner is unavailable." });
+      return false;
+    }
+    void rebuildCodeforcesIndexOnly();
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (message?.type !== "syncAll") {
     return false;
   }
@@ -674,7 +789,9 @@ function handleCodeforcesSyncMessage(message, sender, sendResponse) {
     return false;
   }
 
-  void window.CodePusherSync.run(CODEFORCES_SYNC_PROVIDER, message.limit);
+  void window.CodePusherSync.run(CODEFORCES_SYNC_PROVIDER, message.limit, {
+    repushExisting: message.repushExisting === true
+  });
   sendResponse({ ok: true });
   return false;
 }

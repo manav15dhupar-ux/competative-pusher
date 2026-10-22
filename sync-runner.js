@@ -38,15 +38,30 @@ function waitForSyncDelay(milliseconds) {
 
 // Sends a batch of problem metadata to the background index updater and returns any error.
 async function updateSolutionsIndex(entries) {
+  console.log(`CodePusher: sending ${entries.length} index entries.`);
   try {
     const response = await chrome.runtime.sendMessage({
       type: "updateIndex",
       entries
     });
-    return response?.ok ? "" : response?.error || "The solutions index update failed.";
+    return response?.ok ? "" : response?.error || "Index update failed without an error message.";
   } catch (error) {
-    return error?.message || "The solutions index update failed.";
+    return error?.message || "Index update failed without an error message.";
   }
+}
+
+// Retrieves known solution folders from the background worker for sync deduplication.
+async function listExistingFolders() {
+  const response = await chrome.runtime.sendMessage({ type: "listExistingFolders" });
+  if (!response?.ok || !response.folders) {
+    throw new Error(response?.error || "Could not list existing solution folders.");
+  }
+  return response.folders;
+}
+
+// Builds a stable key so repeated problem metadata is included only once per index batch.
+function getIndexEntryKey(entry) {
+  return `${entry.platform}:${entry.number}`;
 }
 
 // Deduplicates accepted submissions by problem and selects the newest submission.
@@ -67,7 +82,7 @@ function getNewestSubmissions(items) {
 }
 
 // Runs one provider sync, keeping requests serial and stopping on repeated errors or rate limiting.
-async function runSync(provider, limit) {
+async function runSync(provider, limit, options = {}) {
   if (syncInProgress) {
     showSyncNotice("A solution sync is already running.", true);
     return { ok: false, error: "A solution sync is already running." };
@@ -85,9 +100,11 @@ async function runSync(provider, limit) {
   }
 
   syncInProgress = true;
-  const counts = { pushed: 0, unchanged: 0, failed: 0 };
-  const entries = [];
+  const counts = { pushed: 0, unchanged: 0, alreadyThere: 0, failed: 0 };
+  const entriesByProblem = new Map();
   let stopMessage = "";
+  let finalNotice = "";
+  let finalNoticeIsError = false;
   try {
     const listedItems = await provider.listAcceptedSubmissions();
     const items = getNewestSubmissions(listedItems);
@@ -97,18 +114,44 @@ async function runSync(provider, limit) {
     const selected = items.slice(0, boundedLimit);
 
     if (!window.confirm(`Push ${selected.length} solutions to GitHub?`)) {
-      showSyncNotice("Sync cancelled.");
+      finalNotice = "Sync cancelled.";
       return { ok: true, cancelled: true };
     }
 
+    const existingFolders = provider.getExistingFolder
+      ? await listExistingFolders()
+      : null;
+    const preparedItems = selected.map((item) => ({
+      item,
+      folder: provider.getExistingFolder
+        ? provider.getExistingFolder(item, existingFolders) || ""
+        : ""
+    }));
+    for (const { item, folder } of preparedItems) {
+      if (folder && provider.getIndexEntry) {
+        const entry = provider.getIndexEntry(item, folder);
+        if (entry) {
+          entriesByProblem.set(getIndexEntryKey(entry), entry);
+        }
+      }
+    }
+    const workItems = preparedItems.filter(({ folder }) =>
+      options.repushExisting === true || !folder
+    );
+    counts.alreadyThere = preparedItems.length - workItems.length;
+
     let consecutiveErrors = 0;
-    for (let index = 0; index < selected.length; index += 1) {
-      const item = selected[index];
-      showSyncNotice(`Syncing ${index + 1}/${selected.length}: ${item.slug}`);
+    let leftUnprocessed = 0;
+    for (let index = 0; index < workItems.length; index += 1) {
+      const item = workItems[index].item;
+      showSyncNotice(`Syncing ${index + 1}/${workItems.length}: ${item.slug}`);
       try {
         const result = await provider.pushOne(item);
         if (result?.entry) {
-          entries.push(result.entry);
+          const key = getIndexEntryKey(result.entry);
+          if (!entriesByProblem.has(key)) {
+            entriesByProblem.set(key, result.entry);
+          }
         }
         if (result?.status === "unchanged" || result?.alreadyUpToDate) {
           counts.unchanged += 1;
@@ -128,22 +171,25 @@ async function runSync(provider, limit) {
           stopMessage = error?.status === 429
             ? "Stopped: HTTP 429 received."
             : `Stopped: ${error?.message || "The site returned a non-OK response or challenge page."}`;
+          leftUnprocessed = workItems.length - index - 1;
           break;
         }
         if (consecutiveErrors >= 3) {
           stopMessage = "Stopped: 3 errors in a row.";
+          leftUnprocessed = workItems.length - index - 1;
           break;
         }
       }
 
-      if (index < selected.length - 1) {
+      if (index < workItems.length - 1) {
         await waitForSyncDelay(provider.delayMs);
       }
     }
 
-    const summary = `Done: ${counts.pushed} pushed, ${counts.unchanged} already up to date, ${counts.failed} failed`;
-    showSyncNotice(stopMessage ? `${stopMessage} ${summary}` : summary, Boolean(stopMessage));
-    return { ok: true, ...counts, stopped: stopMessage || "" };
+    const summary = `Done: ${counts.pushed} pushed, ${counts.unchanged} already up to date, ${counts.alreadyThere} already there, ${counts.failed} failed`;
+    finalNotice = `${stopMessage ? `${stopMessage} ` : ""}${summary}${stopMessage ? `; ${leftUnprocessed} items left unprocessed` : ""}`;
+    finalNoticeIsError = Boolean(stopMessage);
+    return { ok: true, ...counts, stopped: stopMessage || "", leftUnprocessed };
   } catch (error) {
     const message = error?.message || "Could not list accepted submissions.";
     const stopped = error?.stopSync || error?.status === 429 ||
@@ -151,12 +197,19 @@ async function runSync(provider, limit) {
     const notice = error?.status === 429
       ? `Stopped: HTTP 429 received. ${message}`
       : `${stopped ? "Stopped" : "Sync failed"}: ${message}`;
-    showSyncNotice(notice, true);
+    finalNotice = notice;
+    finalNoticeIsError = true;
     return { ok: false, error: message };
   } finally {
-    const indexError = await updateSolutionsIndex(entries);
+    const indexError = await updateSolutionsIndex([...entriesByProblem.values()]);
     if (indexError) {
-      showSyncNotice(`Solutions index update failed: ${indexError}`, true);
+      finalNotice = [finalNotice, `Solutions index update failed: ${indexError}`]
+        .filter(Boolean)
+        .join(" ");
+      finalNoticeIsError = true;
+    }
+    if (finalNotice) {
+      showSyncNotice(finalNotice, finalNoticeIsError);
     }
     syncInProgress = false;
   }
@@ -165,5 +218,6 @@ async function runSync(provider, limit) {
 // Exposes the shared sync runner to site-specific content-script providers.
 window.CodePusherSync = Object.freeze({
   run: runSync,
-  updateIndex: updateSolutionsIndex
+  updateIndex: updateSolutionsIndex,
+  listExistingFolders
 });

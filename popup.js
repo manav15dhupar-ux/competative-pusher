@@ -5,9 +5,12 @@ const SYNC_SITES = Object.freeze({
   "codeforces.com": { name: "Codeforces" }
 });
 const syncButton = document.querySelector("#sync");
+const rebuildIndexButton = document.querySelector("#rebuild-index");
 const limitInput = document.querySelector("#limit");
+const repushExistingInput = document.querySelector("#repush-existing");
 const statusMessage = document.querySelector("#status");
 let activeTabId = null;
+let activeSiteHostname = "";
 
 // Enables sync only when the active tab belongs to a supported site.
 async function initializePopup() {
@@ -16,13 +19,17 @@ async function initializePopup() {
     const hostname = tab?.url ? new URL(tab.url).hostname : "";
     const site = SYNC_SITES[hostname];
     activeTabId = site ? tab.id : null;
+    activeSiteHostname = site ? hostname : "";
     syncButton.disabled = !site;
+    rebuildIndexButton.disabled = hostname !== "codeforces.com";
     statusMessage.textContent = site
       ? `Ready to sync ${site.name} solutions.`
       : "Open leetcode.com or codeforces.com first";
   } catch (error) {
     activeTabId = null;
+    activeSiteHostname = "";
     syncButton.disabled = true;
+    rebuildIndexButton.disabled = true;
     statusMessage.textContent = `Could not check the active tab: ${error.message}`;
   }
 }
@@ -46,7 +53,8 @@ async function startSync() {
   try {
     const response = await chrome.tabs.sendMessage(activeTabId, {
       type: "syncAll",
-      limit
+      limit,
+      repushExisting: repushExistingInput.checked
     });
     if (!response?.ok) {
       throw new Error(response?.error || "The site did not start the sync.");
@@ -59,5 +67,30 @@ async function startSync() {
   }
 }
 
+// Starts the Codeforces metadata-only index rebuild from the active tab.
+async function rebuildIndexOnly() {
+  if (activeTabId === null || activeSiteHostname !== "codeforces.com") {
+    statusMessage.textContent = "Open codeforces.com first";
+    return;
+  }
+
+  rebuildIndexButton.disabled = true;
+  statusMessage.textContent = "Starting Codeforces index rebuild...";
+  try {
+    const response = await chrome.tabs.sendMessage(activeTabId, {
+      type: "rebuildIndexOnly"
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error || "Codeforces did not start the index rebuild.");
+    }
+    statusMessage.textContent = "Index rebuild started. Progress appears on the page.";
+  } catch (error) {
+    statusMessage.textContent = `Could not start index rebuild: ${error.message}`;
+  } finally {
+    rebuildIndexButton.disabled = activeSiteHostname !== "codeforces.com";
+  }
+}
+
 syncButton.addEventListener("click", startSync);
+rebuildIndexButton.addEventListener("click", rebuildIndexOnly);
 initializePopup();

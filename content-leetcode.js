@@ -527,6 +527,10 @@ async function pushOneLeetCodeSubmission(item) {
 const LEETCODE_SYNC_PROVIDER = {
   name: "LeetCode",
   listAcceptedSubmissions: listLeetCodeSubmissions,
+  // Matches a known folder by the stable LeetCode problem slug suffix.
+  getExistingFolder(item, folders) {
+    return folders.leetcode.find((folder) => folder.endsWith(`-${item.slug}`)) || "";
+  },
   pushOne: pushOneLeetCodeSubmission,
   delayMs: 2000
 };
@@ -545,7 +549,9 @@ function handleLeetCodeSyncMessage(message, sender, sendResponse) {
     return false;
   }
 
-  void window.CodePusherSync.run(LEETCODE_SYNC_PROVIDER, message.limit);
+  void window.CodePusherSync.run(LEETCODE_SYNC_PROVIDER, message.limit, {
+    repushExisting: message.repushExisting === true
+  });
   sendResponse({ ok: true });
   return false;
 }

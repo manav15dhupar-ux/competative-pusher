@@ -70,10 +70,10 @@ function getSupportedContentScriptPlatform(sender) {
   }
 }
 
-// Validates one index entry against the sending platform and repository path rules.
-function isValidIndexEntry(entry, senderPlatform) {
+// Returns the first safe field-level validation failure for one index entry.
+function getIndexEntryValidationError(entry, senderPlatform) {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-    return false;
+    return { field: "entry", reason: "must be an object" };
   }
   const expectedKeys = [
     "platform",
@@ -85,71 +85,107 @@ function isValidIndexEntry(entry, senderPlatform) {
     "url",
     "language"
   ];
-  if (
-    Object.keys(entry).length !== expectedKeys.length ||
-    expectedKeys.some((key) => !Object.hasOwn(entry, key))
-  ) {
-    return false;
+  const missingKey = expectedKeys.find((key) => !Object.hasOwn(entry, key));
+  if (missingKey) {
+    return { field: missingKey, reason: "is required" };
+  }
+  if (Object.keys(entry).length !== expectedKeys.length) {
+    return { field: "entry", reason: "contains unsupported fields" };
   }
   const stringLimits = {
     platform: 16,
     number: 32,
     title: 300,
-    difficulty: 16,
     folder: 256,
     url: 2048,
     language: 32
   };
-  if (Object.entries(stringLimits).some(([key, maxLength]) =>
-    typeof entry[key] !== "string" ||
-    !entry[key] ||
-    entry[key].length > maxLength
-  )) {
-    return false;
+  for (const [key, maxLength] of Object.entries(stringLimits)) {
+    if (typeof entry[key] !== "string") {
+      return { field: key, reason: "must be a string" };
+    }
+    if (!entry[key] && key !== "title") {
+      return { field: key, reason: "must not be empty" };
+    }
+    if (entry[key].length > maxLength) {
+      return { field: key, reason: `must be at most ${maxLength} characters` };
+    }
   }
   if (
-    entry.platform !== senderPlatform ||
     !["leetcode", "codeforces"].includes(entry.platform) ||
-    !entry.title.trim() ||
-    /[\u0000-\u001f]/.test(entry.title) ||
-    !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(entry.folder) ||
-    !Object.hasOwn(LANGUAGE_EXTENSIONS, entry.language.toLowerCase())
+    entry.platform !== senderPlatform
   ) {
-    return false;
+    return { field: "platform", reason: "must match the supported sender platform" };
   }
-
+  if (typeof entry.difficulty !== "string" || entry.difficulty.length > 16) {
+    return { field: "difficulty", reason: "must be a string of at most 16 characters" };
+  }
+  if (typeof entry.rating !== "string" && typeof entry.rating !== "number") {
+    return { field: "rating", reason: "must be a number or 'Unrated'" };
+  }
+  if (!entry.title.trim()) {
+    return { field: "title", reason: "must not be empty" };
+  }
   const numberPattern = entry.platform === "leetcode"
     ? /^\d+$/
     : /^\d+[A-Za-z]$/;
   const folderPrefix = entry.platform === "leetcode"
     ? `${entry.number.padStart(4, "0")}-`
     : `${entry.number.toLowerCase()}-`;
-  if (!numberPattern.test(entry.number) || !entry.folder.startsWith(folderPrefix)) {
-    return false;
+  if (!numberPattern.test(entry.number)) {
+    return { field: "number", reason: "has an invalid format for its platform" };
   }
-  if (
-    entry.platform === "leetcode"
-      ? !["Easy", "Medium", "Hard"].includes(entry.difficulty) || entry.rating !== ""
-      : entry.difficulty !== "" ||
-        !(entry.rating === "Unrated" ||
-          Number.isSafeInteger(entry.rating) && entry.rating >= 0)
-  ) {
-    return false;
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(entry.folder)) {
+    return { field: "folder", reason: "must use lowercase letters, digits, and single hyphens" };
+  }
+  if (!entry.folder.startsWith(folderPrefix)) {
+    return { field: "folder", reason: "must start with the platform problem number" };
+  }
+  if (entry.platform === "leetcode") {
+    if (!["Easy", "Medium", "Hard"].includes(entry.difficulty)) {
+      return { field: "difficulty", reason: "must be Easy, Medium, or Hard for LeetCode" };
+    }
+    if (entry.rating !== "") {
+      return { field: "rating", reason: "must be empty for LeetCode" };
+    }
+  } else {
+    if (entry.difficulty !== "") {
+      return { field: "difficulty", reason: "must be empty for Codeforces" };
+    }
+    if (
+      entry.rating !== "Unrated" &&
+      !(typeof entry.rating === "number" && Number.isSafeInteger(entry.rating) && entry.rating >= 0)
+    ) {
+      return { field: "rating", reason: "must be a non-negative integer or 'Unrated'" };
+    }
   }
 
   let problemUrl;
   try {
     problemUrl = new URL(entry.url);
   } catch {
-    return false;
+    return { field: "url", reason: "must be a valid HTTPS URL on the supported platform" };
   }
   const expectedOrigin = entry.platform === "leetcode"
     ? "https://leetcode.com"
     : "https://codeforces.com";
-  return problemUrl.protocol === "https:" &&
-    problemUrl.origin === expectedOrigin &&
-    !problemUrl.username &&
-    !problemUrl.password;
+  if (problemUrl.protocol !== "https:" || problemUrl.origin !== expectedOrigin) {
+    return { field: "url", reason: `must use HTTPS on ${expectedOrigin}` };
+  }
+  if (problemUrl.username || problemUrl.password) {
+    return { field: "url", reason: "must not include credentials" };
+  }
+  return null;
+}
+
+// Validates one index entry against the sending platform and repository path rules.
+function isValidIndexEntry(entry, senderPlatform) {
+  return getIndexEntryValidationError(entry, senderPlatform) === null;
+}
+
+// Formats an entry validation failure without echoing any submitted field contents.
+function formatIndexEntryError(position, validationError) {
+  return `Index entry ${position}: ${validationError.field} rejected (${validationError.reason})`;
 }
 
 // Checks the required fields and slug format before building a repository path.
@@ -393,7 +429,7 @@ async function upsertContentFile(apiUrl, token, path, content, commitMessage, ex
 // Escapes untrusted problem titles for safe placement in Markdown tables and links.
 function escapeMarkdownTitle(title) {
   return title
-    .replace(/[\r\n]+/g, " ")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
     .replace(/\\/g, "\\\\")
     .replace(/[|\[\]<>`]/g, "\\$&");
 }
@@ -450,7 +486,7 @@ function generateIndexBlock(entries) {
       "| # | Title | Difficulty | Language | Solution |",
       "| --- | --- | --- | --- | --- |",
       ...leetcodeEntries.map((entry) =>
-        `| ${entry.number} | [${escapeMarkdownTitle(entry.title)}](${escapeMarkdownUrl(entry.url)}) | ${entry.difficulty} | ${entry.language} | [Solution](./leetcode/${encodeURIComponent(entry.folder)}/) |`
+        `| ${entry.number} | [${escapeMarkdownTitle(entry.title)}](${escapeMarkdownUrl(entry.url)}) | ${entry.difficulty} | ${escapeMarkdownTitle(entry.language)} | [Solution](./leetcode/${encodeURIComponent(entry.folder)}/) |`
       )
     );
   }
@@ -462,7 +498,7 @@ function generateIndexBlock(entries) {
       "| Problem | Title | Rating | Language | Solution |",
       "| --- | --- | --- | --- | --- |",
       ...codeforcesEntries.map((entry) =>
-        `| ${entry.number} | [${escapeMarkdownTitle(entry.title)}](${escapeMarkdownUrl(entry.url)}) | ${entry.rating} | ${entry.language} | [Solution](./codeforces/${encodeURIComponent(entry.folder)}/) |`
+        `| ${entry.number} | [${escapeMarkdownTitle(entry.title)}](${escapeMarkdownUrl(entry.url)}) | ${entry.rating} | ${escapeMarkdownTitle(entry.language)} | [Solution](./codeforces/${encodeURIComponent(entry.folder)}/) |`
       )
     );
   }
@@ -584,6 +620,50 @@ async function updateSolutionsIndex(incomingEntries) {
   return { entries };
 }
 
+// Builds the recursive Git Trees URL using HEAD to resolve the repository's default branch.
+function buildGitTreeApiUrl(username, repo) {
+  const repositoryPath = [
+    encodeURIComponent(username),
+    encodeURIComponent(repo),
+    "git",
+    "trees",
+    "HEAD"
+  ].join("/");
+  return `https://api.github.com/repos/${repositoryPath}?recursive=1`;
+}
+
+// Lists immediate solution folders under each supported platform with one Git Trees request.
+async function listExistingSolutionFolders() {
+  const settings = await chrome.storage.local.get([
+    "githubToken",
+    "githubUsername",
+    "githubRepo"
+  ]);
+  if (!settings.githubToken || !settings.githubUsername || !settings.githubRepo) {
+    throw new Error("Save your GitHub token, username, and repository in Options first.");
+  }
+
+  const tree = await githubRequest(
+    buildGitTreeApiUrl(settings.githubUsername, settings.githubRepo),
+    settings.githubToken
+  );
+  if (tree.truncated || !Array.isArray(tree.tree)) {
+    throw new Error("GitHub returned an incomplete repository tree.");
+  }
+
+  const folders = { leetcode: [], codeforces: [] };
+  for (const item of tree.tree) {
+    if (item?.type !== "tree" || typeof item.path !== "string") {
+      continue;
+    }
+    const match = item.path.match(/^(leetcode|codeforces)\/([^/]+)$/);
+    if (match) {
+      folders[match[1]].push(match[2]);
+    }
+  }
+  return folders;
+}
+
 // Builds the required platform-specific commit subject for a problem file.
 function getProblemCommitSubject(solution) {
   return solution.site === "leetcode"
@@ -671,16 +751,49 @@ async function pushSolution(solution) {
 
 // Routes options and LeetCode messages while keeping token data in the worker.
 function handleMessage(message, sender, sendResponse) {
+  if (message?.type === "listExistingFolders") {
+    if (!getSupportedContentScriptPlatform(sender)) {
+      sendResponse({ ok: false, error: "Folder listings are only available to supported coding-site content scripts." });
+      return false;
+    }
+    listExistingSolutionFolders().then(
+      (folders) => sendResponse({ ok: true, folders }),
+      (error) => sendResponse({ ok: false, error: error.message })
+    );
+    return true;
+  }
+
   if (message?.type === "updateIndex") {
     const senderPlatform = getSupportedContentScriptPlatform(sender);
-    if (
-      !senderPlatform ||
-      !Array.isArray(message.entries) ||
-      message.entries.length > MAX_INDEX_ENTRIES ||
-      message.entries.some((entry) => !isValidIndexEntry(entry, senderPlatform))
-    ) {
-      sendResponse({ ok: false, error: "Invalid or unsupported solutions index update." });
+    if (!senderPlatform) {
+      const error = "Index update rejected: sender must be a supported coding-site content script.";
+      console.warn(error);
+      sendResponse({ ok: false, error });
       return false;
+    }
+    if (!Array.isArray(message.entries)) {
+      const error = "Index update rejected: entries must be an array.";
+      console.warn(error);
+      sendResponse({ ok: false, error });
+      return false;
+    }
+    if (message.entries.length > MAX_INDEX_ENTRIES) {
+      const error = `Index update rejected: entries must not exceed ${MAX_INDEX_ENTRIES}.`;
+      console.warn(error);
+      sendResponse({ ok: false, error });
+      return false;
+    }
+    for (let index = 0; index < message.entries.length; index += 1) {
+      const validationError = getIndexEntryValidationError(
+        message.entries[index],
+        senderPlatform
+      );
+      if (validationError) {
+        const error = formatIndexEntryError(index + 1, validationError);
+        console.warn(error);
+        sendResponse({ ok: false, error });
+        return false;
+      }
     }
 
     updateSolutionsIndex(message.entries).then(
